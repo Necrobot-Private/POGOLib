@@ -1,5 +1,25 @@
 # POGOLib Changelog
 
+## 1.4.2
+- Updated dependencies.
+- Updated POGOProtos to v2.9.2.
+- Updated TwoFish Encryption.
+- Fixed bug where HeartbeatDispatcher didn't cancel [#84](https://github.com/AeonLucid/POGOLib/pull/84).
+
+## 1.4.1
+- Updated PokeHash to 0.61.0 [#82](https://github.com/AeonLucid/POGOLib/pull/82).
+- Updated POGOProtos to v2.9.1.
+- Fixed [#81](https://github.com/AeonLucid/POGOLib/issues/81).
+- Improved user agent management.
+
+## 1.4.0
+- Added `Pause()` and `ResumeAsync()` methods to `Session`.
+- Updated PokeHash to 0.59.1 [#79](https://github.com/AeonLucid/POGOLib/pull/79).
+- Updated Encryption / Decryption to TwoFish [#79](https://github.com/AeonLucid/POGOLib/pull/79).
+- Fixed [#80](https://github.com/AeonLucid/POGOLib/issues/80).
+- Fixed [#63](https://github.com/AeonLucid/POGOLib/issues/63).
+- **Moved all events to `Session`**.
+
 ## 1.3.1
 - Updated PokeHash to 0.57.4.
 

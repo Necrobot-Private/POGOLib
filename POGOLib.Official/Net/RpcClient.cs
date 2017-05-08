@@ -25,7 +25,6 @@ namespace POGOLib.Official.Net
 {
     public class RpcClient : IDisposable
     {
-
         /// <summary>
         ///     The authenticated <see cref="Session" />.
         /// </summary>
@@ -61,7 +60,7 @@ namespace POGOLib.Official.Net
 
         private readonly ConcurrentDictionary<RequestEnvelope, ByteString> _rpcResponses = new ConcurrentDictionary<RequestEnvelope, ByteString>();
 
-        private static readonly Semaphore RpcQueueMutex = new Semaphore(1, 1);
+        private readonly Semaphore _rpcQueueMutex = new Semaphore(1, 1);
 
         internal RpcClient(Session session)
         {
@@ -78,7 +77,7 @@ namespace POGOLib.Official.Net
         
         internal Platform GetPlatform()
         {
-            return _session.DeviceInfo.DeviceBrand == "Apple" ? Platform.Ios : Platform.Android;
+            return _session.Device.DeviceInfo.DeviceBrand == "Apple" ? Platform.Ios : Platform.Android;
         }
 
         private long PositiveRandom()
@@ -231,14 +230,7 @@ namespace POGOLib.Official.Net
         public async Task RefreshMapObjectsAsync()
         {
             var cellIds = MapUtil.GetCellIdsForLatLong(_session.Player.Coordinate.Latitude, _session.Player.Coordinate.Longitude);
-            var sinceTimeMs = new List<long>(cellIds.Length);
-
-            foreach (var cellId in cellIds)
-            {
-                var cell = _session.Map.Cells.FirstOrDefault(x => x.S2CellId == cellId);
-
-                sinceTimeMs.Add(cell?.CurrentTimestampMs ?? 0);
-            }
+            var sinceTimeMs = cellIds.Select(x => (long) 0).ToArray();
 
             var response = await SendRemoteProcedureCallAsync(new Request
             {
@@ -251,37 +243,45 @@ namespace POGOLib.Official.Net
                     },
                     SinceTimestampMs =
                     {
-                        sinceTimeMs.ToArray()
+                        sinceTimeMs
                     },
                     Latitude = _session.Player.Coordinate.Latitude,
                     Longitude = _session.Player.Coordinate.Longitude
                 }.ToByteString()
             });
 
-            var mapObjects = GetMapObjectsResponse.Parser.ParseFrom(response);
-            if (mapObjects.Status == MapObjectsStatus.Success)
+            if (response != null)
             {
-                // TODO: Cleaner?
-                var pokemonCatchable = mapObjects.MapCells.SelectMany(c => c.CatchablePokemons).Count();
-                var pokemonWild = mapObjects.MapCells.SelectMany(c => c.WildPokemons).Count();
-                var pokemonNearby = mapObjects.MapCells.SelectMany(c => c.NearbyPokemons).Count();
-                var pokemonCount = pokemonCatchable + pokemonWild + pokemonNearby;
-
-                Logger.Debug($"Received '{mapObjects.MapCells.Count}' map cells.");
-                Logger.Debug($"Received '{pokemonCount}' pokemons. Catchable({pokemonCatchable}) Wild({pokemonWild}) Nearby({pokemonNearby})");
-                Logger.Debug($"Received '{mapObjects.MapCells.SelectMany(c => c.Forts).Count()}' forts.");
-
-                if (mapObjects.MapCells.Count == 0)
+                var mapObjects = GetMapObjectsResponse.Parser.ParseFrom(response);
+                if (mapObjects.Status == MapObjectsStatus.Success)
                 {
-                    Logger.Error("We received 0 map cells, are your GPS coordinates correct?");
-                    return;
+                    // TODO: Cleaner?
+                    var pokemonCatchable = mapObjects.MapCells.SelectMany(c => c.CatchablePokemons).Count();
+                    var pokemonWild = mapObjects.MapCells.SelectMany(c => c.WildPokemons).Count();
+                    var pokemonNearby = mapObjects.MapCells.SelectMany(c => c.NearbyPokemons).Count();
+                    var pokemonCount = pokemonCatchable + pokemonWild + pokemonNearby;
+
+                    Logger.Debug($"Received '{mapObjects.MapCells.Count}' map cells.");
+                    Logger.Debug($"Received '{pokemonCount}' pokemons. Catchable({pokemonCatchable}) Wild({pokemonWild}) Nearby({pokemonNearby})");
+                    Logger.Debug($"Received '{mapObjects.MapCells.SelectMany(c => c.Forts).Count()}' forts.");
+
+                    if (mapObjects.MapCells.Count == 0)
+                    {
+                        Logger.Error("We received 0 map cells, are your GPS coordinates correct?");
+                        return;
+                    }
+
+                    _session.Map.Cells = mapObjects.MapCells;
                 }
-                
-                _session.Map.Cells = mapObjects.MapCells;
+                else
+                {
+                    Logger.Error($"GetMapObjects status is: '{mapObjects.Status}'.");
+                }
             }
-            else
+            else if (_session.State != SessionState.Paused)
             {
-                Logger.Error($"GetMapObjects status is: '{mapObjects.Status}'.");
+                // POGOLib didn't expect this.
+                throw new NullReferenceException(nameof(response));
             }
         }
 
@@ -368,8 +368,7 @@ namespace POGOLib.Official.Net
                     }.ToByteString()
                 });
             }
-
-
+            
             //If Incense is active we add this:
             //request.Add(new Request
             //{
@@ -460,14 +459,14 @@ namespace POGOLib.Official.Net
             });
         }
 
-        public async Task<ByteString> SendRemoteProcedureCallAsync(Request request)
+        public async Task<ByteString> SendRemoteProcedureCallAsync(Request request, bool addDefaultRequests = true)
         {
-            return await SendRemoteProcedureCall(await GetRequestEnvelopeAsync(new[] {request}, true));
+            return await SendRemoteProcedureCall(await GetRequestEnvelopeAsync(new[] {request}, addDefaultRequests));
         }
 
-        public async Task<ByteString> SendRemoteProcedureCallAsync(Request[] request)
+        public async Task<ByteString> SendRemoteProcedureCallAsync(Request[] request, bool addDefaultRequests = false)
         {
-            return await SendRemoteProcedureCall(await GetRequestEnvelopeAsync(request, false));
+            return await SendRemoteProcedureCall(await GetRequestEnvelopeAsync(request, addDefaultRequests));
         }
 
         private Task<ByteString> SendRemoteProcedureCall(RequestEnvelope requestEnvelope)
@@ -478,7 +477,7 @@ namespace POGOLib.Official.Net
 
                 try
                 {
-                    RpcQueueMutex.WaitOne();
+                    _rpcQueueMutex.WaitOne();
 
                     RequestEnvelope processRequestEnvelope;
                     while (_rpcQueue.TryDequeue(out processRequestEnvelope))
@@ -500,7 +499,7 @@ namespace POGOLib.Official.Net
                 }
                 finally
                 {
-                    RpcQueueMutex.Release();
+                    _rpcQueueMutex.Release();
                 }
             });
         }
@@ -509,6 +508,22 @@ namespace POGOLib.Official.Net
         {
             try
             {
+                switch (_session.State)
+                {
+                    case SessionState.Stopped:
+                        Logger.Error("We tried to send a request while the session was stopped.");
+                        return null;
+
+                    case SessionState.Paused:
+                        var requests = requestEnvelope.Requests.Select(x => x.RequestType).ToList();
+                        if (requests.Count != 1 || requests[0] != RequestType.VerifyChallenge) 
+                        {
+                            Logger.Error("We tried to send a request while the session was paused. The only request allowed is VerifyChallenge.");
+                            return null;
+                        }
+                        break;
+                }
+
                 using (var requestData = new ByteArrayContent(requestEnvelope.ToByteArray()))
                 {
                     Logger.Debug($"Sending RPC Request: '{string.Join(", ", requestEnvelope.Requests.Select(x => x.RequestType))}'");
@@ -705,7 +720,7 @@ namespace POGOLib.Official.Net
 
                 switch (responseIndex.Value)
                 {
-                    case RequestType.GetHatchedEggs: // Get_Hatched_Eggs
+                    case RequestType.GetHatchedEggs:
                         var hatchedEggs = GetHatchedEggsResponse.Parser.ParseFrom(bytes);
                         if (hatchedEggs.Success)
                         {
@@ -713,7 +728,7 @@ namespace POGOLib.Official.Net
                         }
                         break;
 
-                    case RequestType.GetInventory: // Get_Inventory
+                    case RequestType.GetInventory:
                         var inventory = GetInventoryResponse.Parser.ParseFrom(bytes);
                         if (inventory.Success)
                         {
@@ -731,7 +746,7 @@ namespace POGOLib.Official.Net
                         }
                         break;
 
-                    case RequestType.CheckAwardedBadges: // Check_Awarded_Badges
+                    case RequestType.CheckAwardedBadges:
                         var awardedBadges = CheckAwardedBadgesResponse.Parser.ParseFrom(bytes);
                         if (awardedBadges.Success)
                         {
@@ -739,7 +754,7 @@ namespace POGOLib.Official.Net
                         }
                         break;
 
-                    case RequestType.DownloadSettings: // Download_Settings
+                    case RequestType.DownloadSettings:
                         var downloadSettings = DownloadSettingsResponse.Parser.ParseFrom(bytes);
                         if (string.IsNullOrEmpty(downloadSettings.Error))
                         {
@@ -762,14 +777,13 @@ namespace POGOLib.Official.Net
                             Logger.Debug($"DownloadSettingsResponse.Error: '{downloadSettings.Error}'");
                         }
                         break;
-
-                    // TODO: Let the developer know about this somehow.
+                        
                     case RequestType.CheckChallenge:
                         var checkChallenge = CheckChallengeResponse.Parser.ParseFrom(bytes);
                         if (checkChallenge.ShowChallenge)
                         {
-                            Logger.Warn($"Received Captcha on {_session.AccessToken.Username}");
-                            Logger.Warn(JsonConvert.SerializeObject(checkChallenge, Formatting.Indented));
+                            _session.Pause();
+                            _session.OnCaptchaReceived(checkChallenge.ChallengeUrl);
                         }
                         break;
                 }
@@ -779,15 +793,13 @@ namespace POGOLib.Official.Net
         public void Dispose()
         {
             Dispose(true);
-            GC.SuppressFinalize(this);
         }
 
-        private void Dispose(bool disposing)
+        internal void Dispose(bool disposing)
         {
-            if (disposing)
-            {
+            if (!disposing) return;
 
-            }
+            _rpcQueueMutex?.Dispose();
         }
     }
 }

@@ -31,7 +31,7 @@ namespace POGOLib.Official.Pokemon
         /// </summary>
         private async Task CheckDispatch(TaskCompletionSource<bool> firstRefreshCompleted)
         {
-            while (!_heartbeatCancellation.IsCancellationRequested)
+            while (!_heartbeatCancellation.IsCancellationRequested && (_session.State == SessionState.Started || _session.State == SessionState.Resumed))
             {
                 var canRefresh = false;
                 if (_session.GlobalSettings != null)
@@ -89,17 +89,22 @@ namespace POGOLib.Official.Pokemon
                 // cancelled
                 catch (OperationCanceledException)
                 {
-                    return;
+                    break;
                 }
             }
+
+            firstRefreshCompleted?.TrySetResult(false);
+
+            Logger.Debug("Heartbeat got cancelled");
         }
 
-        internal async Task StartDispatcher()
+        internal async Task StartDispatcherAsync()
         {
             if (_heartbeatTask != null)
             {
                 throw new Exception("Heartbeat task already running");
             }
+
             var firstRefreshCompleted = new TaskCompletionSource<bool>();
             _heartbeatCancellation = new CancellationTokenSource();
             _heartbeatTask = CheckDispatch(firstRefreshCompleted);

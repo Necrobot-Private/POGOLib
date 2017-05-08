@@ -2,18 +2,19 @@
 using System.Linq;
 using System.Net;
 using System.Net.Http;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using GeoCoordinatePortable;
+using POGOLib.Official.Exceptions;
 using POGOLib.Official.Logging;
 using POGOLib.Official.LoginProviders;
 using POGOLib.Official.Net.Authentication.Data;
+using POGOLib.Official.Net.Captcha;
 using POGOLib.Official.Pokemon;
 using POGOLib.Official.Util.Device;
 using POGOLib.Official.Util.Hash;
+using POGOProtos.Data;
 using POGOProtos.Settings;
-using static POGOProtos.Networking.Envelopes.Signature.Types;
 
 namespace POGOLib.Official.Net
 {
@@ -22,7 +23,8 @@ namespace POGOLib.Official.Net
     /// </summary>
     public class Session : IDisposable
     {
-        
+        private SessionState _state;
+
         /// <summary>
         /// This is the <see cref="HeartbeatDispatcher" /> which is responsible for retrieving events and updating gps location.
         /// </summary>
@@ -42,27 +44,43 @@ namespace POGOLib.Official.Net
         // public IDataCache DataCache { get; set; } = new MemoryDataCache();
         // public Templates Templates { get; private set; }
 
-        internal Session(ILoginProvider loginProvider, AccessToken accessToken, GeoCoordinate geoCoordinate, DeviceInfo deviceInfo = null)
+        internal Session(ILoginProvider loginProvider, AccessToken accessToken, GeoCoordinate geoCoordinate, DeviceWrapper deviceWrapper = null)
         {
             if (!ValidLoginProviders.Contains(loginProvider.ProviderId))
             {
                 throw new ArgumentException($"LoginProvider ID must be one of the following: {string.Join(", ", ValidLoginProviders)}");
             }
 
+            State = SessionState.Stopped;
+            Device = deviceWrapper ?? DeviceInfoUtil.GetRandomDevice();
+
             HttpClient = new HttpClient(new HttpClientHandler
             {
                 AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
             });
-            HttpClient.DefaultRequestHeaders.UserAgent.TryParseAdd("Niantic App");
+            HttpClient.DefaultRequestHeaders.UserAgent.TryParseAdd(Constants.ApiUserAgent);
             HttpClient.DefaultRequestHeaders.ExpectContinue = false;
-            
-            DeviceInfo = deviceInfo ?? DeviceInfoUtil.GetRandomDevice(this);
+
             AccessToken = accessToken;
             LoginProvider = loginProvider;
-            Player = new Player(geoCoordinate);
+            Player = new Player(this, geoCoordinate);
             Map = new Map(this);
             RpcClient = new RpcClient(this);
             _heartbeat = new HeartbeatDispatcher(this);
+        }
+
+        /// <summary>
+        /// Gets the <see cref="SessionState"/> of the <see cref="Session"/>.
+        /// </summary>
+        public SessionState State
+        {
+            get { return _state; }
+            private set
+            {
+                _state = value;
+
+                Logger.Debug($"Session state was set to {_state}.");
+            }
         }
 
         /// <summary>
@@ -71,14 +89,14 @@ namespace POGOLib.Official.Net
         internal Random Random { get; private set; } = new Random();
 
         /// <summary>
+        /// Gets the <see cref="DeviceWrapper"/> used by <see cref="RpcEncryption"/>.
+        /// </summary>
+        public DeviceWrapper Device { get; private set; }
+
+        /// <summary>
         /// Gets the <see cref="HttpClient"/> of the <see cref="Session"/>.
         /// </summary>
         internal HttpClient HttpClient { get; }
-
-        /// <summary>
-        /// Gets the <see cref="DeviceInfo"/> used by <see cref="RpcEncryption"/>.
-        /// </summary>
-        public DeviceInfo DeviceInfo { get; private set; }
 
         /// <summary>
         /// Gets the <see cref="ILoginProvider"/> used to obtain an <see cref="AccessToken"/>.
@@ -114,23 +132,62 @@ namespace POGOLib.Official.Net
 
         public async Task<bool> StartupAsync()
         {
+            if (State != SessionState.Stopped)
+            {
+                throw new SessionStateException("The session has already been started.");
+            }
+
             if (!Configuration.IgnoreHashVersion)
             {
                 await CheckHasherVersion();
             }
 
-            if (!await RpcClient.StartupAsync().ConfigureAwait(false))
+            State = SessionState.Started;
+
+            if (!await RpcClient.StartupAsync())
             {
                 return false;
             }
 
-            await _heartbeat.StartDispatcher().ConfigureAwait(false);
+            await _heartbeat.StartDispatcherAsync();
 
             return true;
         }
 
+        public void Pause()
+        {
+            if (State != SessionState.Started &&
+                State != SessionState.Resumed)
+            {
+                throw new SessionStateException("The session is not running.");
+            }
+            
+            State = SessionState.Paused;
+
+            _heartbeat.StopDispatcher();
+        }
+
+        public async Task ResumeAsync()
+        {
+            if (State != SessionState.Paused)
+            {
+                throw new SessionStateException("The session is not paused.");
+            }
+            
+            State = SessionState.Resumed;
+
+            await _heartbeat.StartDispatcherAsync();
+        }
+
         public void Shutdown()
         {
+            if (State == SessionState.Stopped)
+            {
+                throw new SessionStateException("The session has already been stopped.");
+            }
+
+            State = SessionState.Stopped;
+            
             _heartbeat.StopDispatcher();
         }
 
@@ -141,15 +198,19 @@ namespace POGOLib.Official.Net
         /// <returns></returns>
         public async Task CheckHasherVersion()
         {
-            var pogoVersionRaw = await HttpClient.GetStringAsync(Constants.VersionUrl);
-            pogoVersionRaw = pogoVersionRaw.Replace("\n", "");
-            pogoVersionRaw = pogoVersionRaw.Replace("\u0006", "");
-
-            var pogoVersion = new Version(pogoVersionRaw);
-            var result = Configuration.Hasher.PokemonVersion.CompareTo(pogoVersion);
-            if (result != 0)
+            using (var checkHttpClient = new HttpClient())
             {
-                throw new HashVersionMismatchException($"The version of the {nameof(Configuration.Hasher)} ({Configuration.Hasher.PokemonVersion}) does not match the minimal API version of PokemonGo ({pogoVersion}). Set 'Configuration.IgnoreHashVersion' to true if you want to disable the version check.");
+                checkHttpClient.DefaultRequestHeaders.UserAgent.TryParseAdd(Device.UserAgent);
+
+                var clientVersionRaw = await checkHttpClient.GetByteArrayAsync(Constants.VersionUrl);
+                var clientVersion = ClientVersion.Parser.ParseFrom(clientVersionRaw);
+
+                var pogoVersion = new Version(clientVersion.MinVersion);
+                var result = Configuration.Hasher.PokemonVersion.CompareTo(pogoVersion);
+                if (result < 0)
+                {
+                    throw new HashVersionMismatchException($"The version of the {nameof(Configuration.Hasher)} ({Configuration.Hasher.PokemonVersion}) does not match the minimal API version of PokemonGo ({pogoVersion}). Set 'Configuration.IgnoreHashVersion' to true if you want to disable the version check.");
+                }
             }
         }
 
@@ -189,17 +250,43 @@ namespace POGOLib.Official.Net
             ReauthenticateMutex.Release();
         }
 
+        #region Events
         private void OnAccessTokenUpdated()
         {
             AccessTokenUpdated?.Invoke(this, EventArgs.Empty);
         }
 
+        internal void OnInventoryUpdate()
+        {
+            InventoryUpdate?.Invoke(this, EventArgs.Empty);
+        }
+
+        internal void OnMapUpdate()
+        {
+            MapUpdate?.Invoke(this, EventArgs.Empty);
+        }
+
+        internal void OnCaptchaReceived(string url)
+        {
+            CaptchaReceived?.Invoke(this, new CaptchaEventArgs(url));
+        }
+
         public event EventHandler<EventArgs> AccessTokenUpdated;
-        
+
+        public event EventHandler<EventArgs> InventoryUpdate;
+
+        public event EventHandler<EventArgs> MapUpdate;
+
+        /// <summary>
+        /// If you have successfully solved the captcha using VerifyChallegenge, 
+        /// you can resume POGOLib by using <see cref="ResumeAsync"/>.
+        /// </summary>
+        public event EventHandler<CaptchaEventArgs> CaptchaReceived;
+        #endregion
+
         public void Dispose()
         {
             Dispose(true);
-            GC.SuppressFinalize(this);
         }
 
         protected virtual void Dispose(bool disposing)

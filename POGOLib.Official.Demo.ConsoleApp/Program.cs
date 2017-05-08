@@ -16,6 +16,7 @@ using POGOProtos.Networking.Requests.Messages;
 using POGOProtos.Networking.Responses;
 using LogLevel = POGOLib.Official.Logging.LogLevel;
 using POGOLib.Official.Extensions;
+using POGOLib.Official.Net.Captcha;
 
 namespace POGOLib.Official.Demo.ConsoleApp
 {
@@ -109,8 +110,9 @@ namespace POGOLib.Official.Demo.ConsoleApp
             SaveAccessToken(session.AccessToken);
 
             session.AccessTokenUpdated += SessionOnAccessTokenUpdated;
-            session.Player.Inventory.Update += InventoryOnUpdate;
-            session.Map.Update += MapOnUpdate;
+            session.InventoryUpdate += InventoryOnUpdate;
+            session.MapUpdate += MapOnUpdate;
+            session.CaptchaReceived += SessionOnCaptchaReceived;
 
             // Send initial requests and start HeartbeatDispatcher.
             // This makes sure that the initial heartbeat request finishes and the "session.Map.Cells" contains stuff.
@@ -133,9 +135,17 @@ namespace POGOLib.Official.Demo.ConsoleApp
                         Longitude = closestFort.Longitude
                     }.ToByteString()
                 });
-                var fortDetailsResponse = FortDetailsResponse.Parser.ParseFrom(fortDetailsBytes);
 
-                Console.WriteLine(JsonConvert.SerializeObject(fortDetailsResponse, Formatting.Indented));
+                if (fortDetailsBytes != null)
+                {
+                    var fortDetailsResponse = FortDetailsResponse.Parser.ParseFrom(fortDetailsBytes);
+
+                    Console.WriteLine(JsonConvert.SerializeObject(fortDetailsResponse, Formatting.Indented));
+                }
+                else
+                {
+                    Console.WriteLine("Couldn't print fort info, we probably had a captcha.");   
+                }
             }
             else
             {
@@ -146,7 +156,28 @@ namespace POGOLib.Official.Demo.ConsoleApp
             HandleCommands();
         }
 
-        private static void SessionOnAccessTokenUpdated(object sender, EventArgs eventArgs)
+        private static void SessionOnCaptchaReceived(object sender, CaptchaEventArgs e)
+        {
+            var session = (Session)sender;
+
+            Logger.Warn("Captcha received: " + e.CaptchaUrl);
+
+            // Solve
+//            var verifyChallengeResponse = await session.RpcClient.SendRemoteProcedureCallAsync(new Request
+//            {
+//                RequestType = RequestType.VerifyChallenge,
+//                RequestMessage = new VerifyChallengeMessage
+//                {
+//                    Token = "token"
+//                }.ToByteString()
+//            }, false);
+//
+//            var verifyChallenge = VerifyChallengeResponse.Parser.ParseFrom(verifyChallengeResponse);
+//            
+//            Console.WriteLine(JsonConvert.SerializeObject(verifyChallenge, Formatting.Indented));
+        }
+
+        private static void SessionOnAccessTokenUpdated(object sender, EventArgs e)
         {
             var session = (Session)sender;
 
@@ -155,12 +186,12 @@ namespace POGOLib.Official.Demo.ConsoleApp
             Logger.Info("Saved access token to file.");
         }
 
-        private static void InventoryOnUpdate(object sender, EventArgs eventArgs)
+        private static void InventoryOnUpdate(object sender, EventArgs e)
         {
             Logger.Info("Inventory was updated.");
         }
 
-        private static void MapOnUpdate(object sender, EventArgs eventArgs)
+        private static void MapOnUpdate(object sender, EventArgs e)
         {
             Logger.Info("Map was updated.");
         }
